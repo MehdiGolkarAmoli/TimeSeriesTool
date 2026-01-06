@@ -1,6 +1,6 @@
 """
-Sentinel-2 Time Series Downloader with Gap-Filling
-A Streamlit application for downloading cloud-free Sentinel-2 monthly composites
+Sentinel-2 Time Series Viewer with Gap-Filling
+A Streamlit application for viewing cloud-free Sentinel-2 monthly composites
 with temporal gap-filling using adjacent months.
 """
 
@@ -26,7 +26,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # Set page configuration - MUST BE THE FIRST STREAMLIT COMMAND
 st.set_page_config(
     layout="wide", 
-    page_title="Sentinel-2 Time Series Downloader",
+    page_title="Sentinel-2 Time Series Viewer",
     page_icon="🛰️"
 )
 
@@ -41,14 +41,14 @@ import geemap
 # ============================================================================
 # Session State Initialization
 # ============================================================================
-if 'drawn_polygon' not in st.session_state:
-    st.session_state.drawn_polygon = None
+if 'drawn_polygons' not in st.session_state:
+    st.session_state.drawn_polygons = []
+if 'last_drawn_polygon' not in st.session_state:
+    st.session_state.last_drawn_polygon = None
 if 'ee_initialized' not in st.session_state:
     st.session_state.ee_initialized = False
-if 'downloaded_images' not in st.session_state:
-    st.session_state.downloaded_images = []
-if 'monthly_composites_info' not in st.session_state:
-    st.session_state.monthly_composites_info = []
+if 'monthly_images' not in st.session_state:
+    st.session_state.monthly_images = []
 if 'processing_complete' not in st.session_state:
     st.session_state.processing_complete = False
 
@@ -97,6 +97,22 @@ def initialize_earth_engine():
             return False, f"Authentication failed: {str(auth_error)}"
 
 # ============================================================================
+# Helper Functions
+# ============================================================================
+def get_utm_zone(longitude):
+    """Determine the UTM zone for a given longitude."""
+    import math
+    return math.floor((longitude + 180) / 6) + 1
+
+def get_utm_epsg(longitude, latitude):
+    """Determine the EPSG code for UTM zone based on longitude and latitude."""
+    zone_number = get_utm_zone(longitude)
+    if latitude >= 0:
+        return f"EPSG:326{zone_number:02d}"
+    else:
+        return f"EPSG:327{zone_number:02d}"
+
+# ============================================================================
 # GEE Processing Functions
 # ============================================================================
 def create_gapfilled_timeseries(aoi, start_date, end_date, 
@@ -105,25 +121,6 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
                                  cdi_threshold=-0.5):
     """
     Create gap-filled monthly Sentinel-2 composites.
-    
-    Parameters:
-    -----------
-    aoi : ee.Geometry
-        Area of interest
-    start_date : str
-        Start date in 'YYYY-MM-DD' format
-    end_date : str
-        End date in 'YYYY-MM-DD' format
-    cloudy_pixel_percentage : int
-        Maximum cloudy pixel percentage filter (default: 10)
-    cloud_probability_threshold : int
-        Cloud probability threshold (default: 65)
-    cdi_threshold : float
-        CDI threshold for cloud detection (default: -0.5)
-    
-    Returns:
-    --------
-    tuple: (final_collection, processed_list, monthly_info)
     """
     
     # Date calculations
@@ -285,164 +282,96 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     return final_collection, processed_list, monthly_composites
 
 # ============================================================================
-# Download Functions
+# Visualization Functions
 # ============================================================================
-def download_monthly_composites(final_collection, aoi, output_dir, scale=10, crs='EPSG:4326'):
-    """
-    Download each monthly composite as a separate GeoTIFF file.
-    
-    Returns:
-    --------
-    list: List of downloaded file paths and their month names
-    """
-    downloaded_files = []
+def get_rgb_thumbnail(image, aoi, scale=100):
+    """Get RGB thumbnail from Earth Engine image."""
+    try:
+        # Select RGB bands and apply visualization
+        rgb_image = image.select(['B4', 'B3', 'B2'])
+        
+        # Get thumbnail URL
+        thumb_url = rgb_image.getThumbURL({
+            'region': aoi,
+            'dimensions': 256,
+            'min': 0,
+            'max': 0.3,
+            'format': 'png'
+        })
+        
+        return thumb_url
+    except Exception as e:
+        return None
+
+def display_composites_from_ee(final_collection, aoi, num_cols=4):
+    """Display RGB previews directly from Earth Engine."""
     
     # Get the list of images
     image_list = final_collection.toList(final_collection.size())
     num_images = image_list.size().getInfo()
     
+    if num_images == 0:
+        st.warning("No images to display.")
+        return
+    
+    st.info(f"Displaying {num_images} monthly composites")
+    
+    # Create progress bar
     progress_bar = st.progress(0)
     status_text = st.empty()
+    
+    # Collect all thumbnail URLs and month names
+    thumbnails = []
     
     for i in range(num_images):
         try:
             img = ee.Image(image_list.get(i))
             month_name = img.get('month_name').getInfo()
             
-            status_text.text(f"Downloading {month_name} ({i+1}/{num_images})...")
+            status_text.text(f"Loading {month_name} ({i+1}/{num_images})...")
             
-            filename = f"{output_dir}/S2_{month_name}.tif"
+            # Get thumbnail URL
+            thumb_url = get_rgb_thumbnail(img, aoi)
             
-            # Use geemap for download (handles tiling automatically)
-            geemap.download_ee_image(
-                image=img,
-                filename=filename,
-                region=aoi,
-                scale=scale,
-                crs=crs
-            )
-            
-            downloaded_files.append({
-                'path': filename,
-                'month_name': month_name,
-                'index': i
-            })
+            if thumb_url:
+                thumbnails.append({
+                    'url': thumb_url,
+                    'month_name': month_name
+                })
             
             progress_bar.progress((i + 1) / num_images)
             
         except Exception as e:
-            st.warning(f"Error downloading {month_name}: {str(e)}")
+            st.warning(f"Error loading image {i}: {str(e)}")
             continue
     
-    status_text.text("Download complete!")
-    return downloaded_files
-
-def download_stacked_image(final_collection, aoi, output_dir, start_date, end_date, scale=10, crs='EPSG:4326'):
-    """
-    Download all monthly composites as a single stacked multi-band GeoTIFF.
-    """
-    status_text = st.empty()
-    status_text.text("Creating stacked image...")
+    status_text.empty()
+    progress_bar.empty()
     
-    # Create stacked image
-    stacked_image = final_collection.toBands()
-    
-    filename = f"{output_dir}/S2_Stacked_{start_date}_to_{end_date}.tif"
-    
-    status_text.text("Downloading stacked image (this may take a while for large areas)...")
-    
-    # Use geemap for download
-    geemap.download_ee_image(
-        image=stacked_image,
-        filename=filename,
-        region=aoi,
-        scale=scale,
-        crs=crs
-    )
-    
-    status_text.text("Download complete!")
-    
-    return filename, stacked_image.bandNames().getInfo()
-
-# ============================================================================
-# Visualization Functions
-# ============================================================================
-def visualize_composites(downloaded_files, num_cols=4):
-    """Display RGB previews of downloaded composites."""
-    import rasterio
-    
-    num_files = len(downloaded_files)
-    if num_files == 0:
-        st.warning("No files to display.")
-        return
-    
-    num_rows = (num_files + num_cols - 1) // num_cols
-    
-    fig, axes = plt.subplots(num_rows, num_cols, figsize=(4*num_cols, 4*num_rows))
-    
-    # Flatten axes for easier indexing
-    if num_rows == 1 and num_cols == 1:
-        axes = np.array([[axes]])
-    elif num_rows == 1:
-        axes = axes.reshape(1, -1)
-    elif num_cols == 1:
-        axes = axes.reshape(-1, 1)
-    
-    for idx, file_info in enumerate(downloaded_files):
-        row = idx // num_cols
-        col = idx % num_cols
-        ax = axes[row, col]
+    # Display thumbnails in a grid
+    if thumbnails:
+        num_rows = (len(thumbnails) + num_cols - 1) // num_cols
         
-        try:
-            with rasterio.open(file_info['path']) as src:
-                # Read RGB bands (B4=Red, B3=Green, B2=Blue -> indices 3, 2, 1)
-                if src.count >= 4:
-                    r = src.read(4)  # B4 - Red
-                    g = src.read(3)  # B3 - Green
-                    b = src.read(2)  # B2 - Blue
-                    
-                    # Normalize for display
-                    rgb = np.dstack([r, g, b])
-                    
-                    # Percentile stretch for better visualization
-                    for i in range(3):
-                        band = rgb[:, :, i]
-                        valid = band[band > 0]
-                        if len(valid) > 0:
-                            p2, p98 = np.percentile(valid, [2, 98])
-                            rgb[:, :, i] = np.clip((band - p2) / (p98 - p2 + 1e-10), 0, 1)
-                    
-                    ax.imshow(rgb)
-                else:
-                    # Single band - show grayscale
-                    data = src.read(1)
-                    ax.imshow(data, cmap='viridis')
-            
-            ax.set_title(file_info['month_name'], fontsize=10)
-            ax.axis('off')
-            
-        except Exception as e:
-            ax.text(0.5, 0.5, f"Error: {str(e)}", ha='center', va='center', transform=ax.transAxes)
-            ax.set_title(file_info['month_name'], fontsize=10)
-            ax.axis('off')
-    
-    # Hide empty subplots
-    for idx in range(num_files, num_rows * num_cols):
-        row = idx // num_cols
-        col = idx % num_cols
-        axes[row, col].axis('off')
-    
-    plt.tight_layout()
-    st.pyplot(fig)
+        for row in range(num_rows):
+            cols = st.columns(num_cols)
+            for col_idx in range(num_cols):
+                img_idx = row * num_cols + col_idx
+                if img_idx < len(thumbnails):
+                    with cols[col_idx]:
+                        st.image(
+                            thumbnails[img_idx]['url'],
+                            caption=thumbnails[img_idx]['month_name'],
+                            use_container_width=True
+                        )
 
 # ============================================================================
 # Main Application
 # ============================================================================
 def main():
     # Title and description
-    st.title("🛰️ Sentinel-2 Time Series Downloader")
+    st.title("🛰️ Sentinel-2 Time Series Viewer")
     st.markdown("""
-    Download cloud-free Sentinel-2 monthly composites with automatic gap-filling.
+    View cloud-free Sentinel-2 monthly composites with automatic gap-filling.
     The algorithm fills cloudy pixels using data from adjacent months (M-1, M+1, M-2).
     """)
     
@@ -478,7 +407,7 @@ def main():
         max_value=100,
         value=10,
         step=5,
-        help="Filter out images with cloud cover above this percentage (CLOUDY_PIXEL_PERCENTAGE metadata)"
+        help="Filter out images with cloud cover above this percentage"
     )
     
     cloud_probability_threshold = st.sidebar.slider(
@@ -497,30 +426,6 @@ def main():
         value=-0.5,
         step=0.1,
         help="Cloud Displacement Index threshold for cloud detection"
-    )
-    
-    # Export parameters
-    st.sidebar.subheader("Export Settings")
-    
-    export_scale = st.sidebar.selectbox(
-        "Export Scale (meters)",
-        options=[10, 20, 30, 60],
-        index=0,
-        help="Spatial resolution for exported images"
-    )
-    
-    export_crs = st.sidebar.selectbox(
-        "Export CRS",
-        options=['EPSG:4326', 'EPSG:32639', 'EPSG:32638', 'EPSG:32640'],
-        index=0,
-        help="Coordinate Reference System for exported images"
-    )
-    
-    download_mode = st.sidebar.radio(
-        "Download Mode",
-        options=["Individual Monthly Files", "Single Stacked File", "Both"],
-        index=0,
-        help="Choose how to download the time series"
     )
     
     # ========================================================================
@@ -569,14 +474,30 @@ def main():
             if geometry['type'] == 'Polygon':
                 coords = geometry['coordinates'][0]
                 polygon = Polygon(coords)
-                st.session_state.drawn_polygon = polygon
+                st.session_state.last_drawn_polygon = polygon
                 
-                # Calculate area
+                # Calculate area and UTM zone
+                centroid = polygon.centroid
+                utm_zone = get_utm_zone(centroid.x)
+                utm_epsg = get_utm_epsg(centroid.x, centroid.y)
                 area_sq_km = polygon.area * 111 * 111
-                st.success(f"✅ Region selected! Approximate area: {area_sq_km:.2f} km²")
+                
+                st.success(f"✅ Region captured! UTM Zone {utm_zone} ({utm_epsg}), Area: ~{area_sq_km:.2f} km². Click 'Save Selected Region' to save it.")
                 
                 if area_sq_km > 100:
-                    st.warning("⚠️ Large area selected. Download may take a long time.")
+                    st.warning("⚠️ Large area selected. Processing may take a long time.")
+    
+    # Save region button
+    if st.button("💾 Save Selected Region"):
+        if st.session_state.last_drawn_polygon is not None:
+            # Check if this polygon is already saved
+            if not any(p.equals(st.session_state.last_drawn_polygon) for p in st.session_state.drawn_polygons):
+                st.session_state.drawn_polygons.append(st.session_state.last_drawn_polygon)
+                st.success(f"✅ Region saved! Total regions: {len(st.session_state.drawn_polygons)}")
+            else:
+                st.info("This polygon is already saved.")
+        else:
+            st.warning("Please draw a polygon on the map first")
     
     # Manual coordinate entry
     with st.expander("📝 Or Enter Coordinates Manually"):
@@ -596,8 +517,38 @@ def main():
                 (min_lon, max_lat),
                 (min_lon, min_lat)
             ]
-            st.session_state.drawn_polygon = Polygon(coords)
-            st.success("✅ Region set from coordinates!")
+            st.session_state.last_drawn_polygon = Polygon(coords)
+            st.success("✅ Region set from coordinates! Click 'Save Selected Region' to save it.")
+    
+    # ========================================================================
+    # Saved Regions Section
+    # ========================================================================
+    if st.session_state.drawn_polygons:
+        st.subheader("📍 Saved Regions")
+        
+        # Display each region with a delete button
+        for i, poly in enumerate(st.session_state.drawn_polygons):
+            col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
+            
+            with col1:
+                st.write(f"**Region {i+1}**")
+            
+            with col2:
+                centroid = poly.centroid
+                utm_zone = get_utm_zone(centroid.x)
+                utm_epsg = get_utm_epsg(centroid.x, centroid.y)
+                st.write(f"UTM: {utm_zone} ({utm_epsg})")
+            
+            with col3:
+                area_sq_km = poly.area * 111 * 111
+                st.write(f"Area: ~{area_sq_km:.2f} km²")
+            
+            with col4:
+                if st.button("🗑️", key=f"delete_region_{i}", help=f"Delete Region {i+1}"):
+                    st.session_state.drawn_polygons.pop(i)
+                    st.rerun()
+        
+        st.divider()
     
     # Step 2: Date Selection
     st.header("2️⃣ Select Time Period")
@@ -631,34 +582,33 @@ def main():
     num_months = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
     st.info(f"📅 Time period: {start_date.strftime('%Y-%m')} to {end_date.strftime('%Y-%m')} ({num_months} months)")
     
-    # Step 3: Download
-    st.header("3️⃣ Download Time Series")
+    # Step 3: Process and View
+    st.header("3️⃣ View Time Series")
     
-    # Display current parameters
-    st.markdown(f"""
-    **Current Parameters:**
-    - 🌥️ Max Cloudy Pixel Percentage: **{cloudy_pixel_percentage}%**
-    - ☁️ Cloud Probability Threshold: **{cloud_probability_threshold}**
-    - 📊 CDI Threshold: **{cdi_threshold}**
-    - 📐 Export Scale: **{export_scale}m**
-    - 🗺️ Export CRS: **{export_crs}**
-    """)
+    # Region selector (if multiple regions saved)
+    selected_polygon = None
+    if len(st.session_state.drawn_polygons) > 0:
+        polygon_index = st.selectbox(
+            "Select region to process",
+            range(len(st.session_state.drawn_polygons)),
+            format_func=lambda i: f"Region {i+1} (~{st.session_state.drawn_polygons[i].area * 111 * 111:.2f} km²)",
+            key="polygon_selector"
+        )
+        selected_polygon = st.session_state.drawn_polygons[polygon_index]
+    elif st.session_state.last_drawn_polygon is not None:
+        selected_polygon = st.session_state.last_drawn_polygon
+        st.info("Using the last drawn polygon (not saved)")
     
-    # Download button
-    if st.button("🚀 Download Time Series", type="primary", use_container_width=True):
+    # Process button
+    if st.button("🚀 Generate Time Series", type="primary", use_container_width=True):
         
-        if st.session_state.drawn_polygon is None:
+        if selected_polygon is None:
             st.error("❌ Please select a region of interest first!")
             st.stop()
         
         # Convert polygon to GEE geometry
-        polygon = st.session_state.drawn_polygon
-        geojson = {"type": "Polygon", "coordinates": [list(polygon.exterior.coords)]}
+        geojson = {"type": "Polygon", "coordinates": [list(selected_polygon.exterior.coords)]}
         aoi = ee.Geometry.Polygon(geojson['coordinates'])
-        
-        # Create output directory
-        output_dir = tempfile.mkdtemp()
-        st.info(f"📁 Output directory: {output_dir}")
         
         # Process time series
         with st.spinner("Processing Sentinel-2 time series with gap-filling..."):
@@ -681,66 +631,27 @@ def main():
                 collection_size = final_collection.size().getInfo()
                 st.success(f"✅ Created {collection_size} monthly composites")
                 
-                # Download based on mode
-                downloaded_files = []
-                stacked_file = None
-                
-                if download_mode in ["Individual Monthly Files", "Both"]:
-                    st.text("Downloading individual monthly files...")
-                    downloaded_files = download_monthly_composites(
-                        final_collection=final_collection,
-                        aoi=aoi,
-                        output_dir=output_dir,
-                        scale=export_scale,
-                        crs=export_crs
-                    )
-                    st.session_state.downloaded_images = downloaded_files
-                
-                if download_mode in ["Single Stacked File", "Both"]:
-                    st.text("Downloading stacked file...")
-                    stacked_file, band_names = download_stacked_image(
-                        final_collection=final_collection,
-                        aoi=aoi,
-                        output_dir=output_dir,
-                        start_date=start_date_str,
-                        end_date=end_date_str,
-                        scale=export_scale,
-                        crs=export_crs
-                    )
-                    st.success(f"✅ Stacked file saved: {stacked_file}")
-                    st.info(f"Band names: {', '.join(band_names[:5])}... ({len(band_names)} total bands)")
-                
+                # Store for display
+                st.session_state.final_collection = final_collection
+                st.session_state.aoi = aoi
                 st.session_state.processing_complete = True
-                st.balloons()
                 
             except Exception as e:
                 st.error(f"❌ Error: {str(e)}")
                 import traceback
                 st.error(traceback.format_exc())
     
-    # Step 4: Visualization
-    if st.session_state.processing_complete and len(st.session_state.downloaded_images) > 0:
-        st.header("4️⃣ Preview Downloaded Composites")
-        
-        st.info(f"Showing RGB composites for {len(st.session_state.downloaded_images)} months")
+    # Step 4: Display Images
+    if st.session_state.processing_complete and 'final_collection' in st.session_state:
+        st.header("4️⃣ Monthly Composites (RGB)")
         
         num_cols = st.slider("Number of columns", min_value=2, max_value=6, value=4)
         
-        visualize_composites(st.session_state.downloaded_images, num_cols=num_cols)
-        
-        # Download buttons for files
-        st.subheader("📥 Download Files")
-        
-        for file_info in st.session_state.downloaded_images:
-            if os.path.exists(file_info['path']):
-                with open(file_info['path'], 'rb') as f:
-                    st.download_button(
-                        label=f"Download {file_info['month_name']}",
-                        data=f,
-                        file_name=f"S2_{file_info['month_name']}.tif",
-                        mime="image/tiff",
-                        key=f"download_{file_info['month_name']}"
-                    )
+        display_composites_from_ee(
+            st.session_state.final_collection, 
+            st.session_state.aoi,
+            num_cols=num_cols
+        )
 
 # ============================================================================
 # Run Application
