@@ -314,7 +314,7 @@ def display_composites_from_ee(final_collection, aoi, num_cols=4):
         st.warning("No images to display.")
         return
     
-    st.info(f"Displaying {num_images} monthly composites")
+    st.success(f"✅ Created {num_images} monthly composites")
     
     # Create progress bar
     progress_bar = st.progress(0)
@@ -350,6 +350,7 @@ def display_composites_from_ee(final_collection, aoi, num_cols=4):
     
     # Display thumbnails in a grid
     if thumbnails:
+        st.subheader("📅 Monthly Composites (RGB)")
         num_rows = (len(thumbnails) + num_cols - 1) // num_cols
         
         for row in range(num_rows):
@@ -427,6 +428,10 @@ def main():
         step=0.1,
         help="Cloud Displacement Index threshold for cloud detection"
     )
+    
+    # Display options
+    st.sidebar.subheader("Display Options")
+    num_cols = st.sidebar.slider("Grid Columns", min_value=2, max_value=6, value=4)
     
     # ========================================================================
     # Main Content
@@ -582,8 +587,8 @@ def main():
     num_months = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
     st.info(f"📅 Time period: {start_date.strftime('%Y-%m')} to {end_date.strftime('%Y-%m')} ({num_months} months)")
     
-    # Step 3: Process and View
-    st.header("3️⃣ View Time Series")
+    # Step 3: Generate and View Time Series
+    st.header("3️⃣ Generate Time Series")
     
     # Region selector (if multiple regions saved)
     selected_polygon = None
@@ -616,8 +621,6 @@ def main():
                 start_date_str = start_date.strftime('%Y-%m-%d')
                 end_date_str = end_date.strftime('%Y-%m-%d')
                 
-                st.text("Creating gap-filled monthly composites...")
-                
                 final_collection, processed_list, monthly_composites = create_gapfilled_timeseries(
                     aoi=aoi,
                     start_date=start_date_str,
@@ -627,31 +630,14 @@ def main():
                     cdi_threshold=cdi_threshold
                 )
                 
-                # Get collection info
-                collection_size = final_collection.size().getInfo()
-                st.success(f"✅ Created {collection_size} monthly composites")
-                
-                # Store for display
-                st.session_state.final_collection = final_collection
-                st.session_state.aoi = aoi
-                st.session_state.processing_complete = True
+                # Display composites immediately
+                st.divider()
+                display_composites_from_ee(final_collection, aoi, num_cols=num_cols)
                 
             except Exception as e:
                 st.error(f"❌ Error: {str(e)}")
                 import traceback
                 st.error(traceback.format_exc())
-    
-    # Step 4: Display Images
-    if st.session_state.processing_complete and 'final_collection' in st.session_state:
-        st.header("4️⃣ Monthly Composites (RGB)")
-        
-        num_cols = st.slider("Number of columns", min_value=2, max_value=6, value=4)
-        
-        display_composites_from_ee(
-            st.session_state.final_collection, 
-            st.session_state.aoi,
-            num_cols=num_cols
-        )
 
 # ============================================================================
 # Run Application
