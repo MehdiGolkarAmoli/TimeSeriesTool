@@ -12,6 +12,11 @@ streamlit==1.31.0
 streamlit-folium==0.18.0
 
 # -----------------------------------------------------------------------------
+# IPython (IMPORTANT: Must be compatible version for geemap)
+# -----------------------------------------------------------------------------
+IPython==8.12.0
+
+# -----------------------------------------------------------------------------
 # Earth Engine and Geospatial Mapping
 # -----------------------------------------------------------------------------
 earthengine-api==0.1.390
@@ -68,3 +73,6 @@ google-auth-oauthlib==1.2.0
 google-auth-httplib2==0.2.0
 google-api-python-client==2.116.0
 
+---
+ipywidgets==8.1.1
+traitlets==5.14.1
