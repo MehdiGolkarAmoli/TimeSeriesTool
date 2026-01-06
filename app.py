@@ -361,7 +361,7 @@ def display_composites_from_ee(final_collection, aoi, num_cols=4):
                         st.image(
                             thumbnails[img_idx]['url'],
                             caption=thumbnails[img_idx]['month_name'],
-                            use_column_width =True
+                            use_column_width=True
                         )
 
 # ============================================================================
@@ -600,7 +600,7 @@ def main():
         st.info("Using the last drawn polygon (not saved)")
     
     # Process button
-    if st.button("🚀 Generate Time Series", type="primary", use_column_width=True):
+    if st.button("🚀 Generate Time Series", type="primary"):
         
         if selected_polygon is None:
             st.error("❌ Please select a region of interest first!")
