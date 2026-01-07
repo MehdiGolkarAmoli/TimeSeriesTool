@@ -46,6 +46,8 @@ if 'thumbnails' not in st.session_state:
     st.session_state.thumbnails = []
 if 'processing_complete' not in st.session_state:
     st.session_state.processing_complete = False
+if 'data_summary' not in st.session_state:
+    st.session_state.data_summary = None
 
 # ============================================================================
 # Constants
@@ -113,6 +115,9 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     """
     Create gap-filled monthly Sentinel-2 composites.
     Uses only M-1 and M+1 for gap-filling.
+    
+    Returns:
+        tuple: (final_collection, total_months, months_with_data)
     """
     
     # Date calculations
@@ -120,6 +125,9 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     end_date_ee = ee.Date(end_date)
     num_months = end_date_ee.get('year').subtract(start_date_ee.get('year')).multiply(12).add(
         end_date_ee.get('month').subtract(start_date_ee.get('month')))
+    
+    # Get total months as integer for reporting
+    total_months = num_months.getInfo()
     
     extended_start = start_date_ee.advance(-1, 'month')
     extended_end = end_date_ee.advance(1, 'month')
@@ -270,7 +278,10 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
             .set('month_name', ee.Image(img).get('month_name'))
     ))
     
-    return final_collection
+    # Get months with data
+    months_with_data = final_collection.size().getInfo()
+    
+    return final_collection, total_months, months_with_data
 
 # ============================================================================
 # Thumbnail Generation Functions
@@ -341,18 +352,17 @@ def generate_and_store_thumbnails(final_collection, aoi):
     
     return thumbnails
 
-def display_thumbnails(thumbnails, num_cols=4):
+def display_thumbnails(thumbnails):
     """
     Display thumbnails from session state.
-    This function only displays, doesn't generate.
+    Fixed 4 columns grid.
     """
     
     if not thumbnails:
         st.info("No images to display. Click 'Generate Time Series' to create composites.")
         return
     
-    st.subheader(f"📅 Monthly Composites (RGB) - {len(thumbnails)} images")
-    
+    num_cols = 4  # Fixed 4 columns
     num_rows = (len(thumbnails) + num_cols - 1) // num_cols
     
     for row in range(num_rows):
@@ -429,9 +439,6 @@ def main():
         step=0.1,
         help="Cloud Displacement Index threshold for cloud detection"
     )
-    
-    st.sidebar.subheader("Display Options")
-    num_cols = st.sidebar.slider("Grid Columns", min_value=2, max_value=6, value=4)
     
     # ========================================================================
     # Main Content - Region Selection
@@ -526,6 +533,7 @@ def main():
                     # Clear thumbnails when region is deleted
                     st.session_state.thumbnails = []
                     st.session_state.processing_complete = False
+                    st.session_state.data_summary = None
                     st.rerun()
         
         st.divider()
@@ -591,6 +599,7 @@ def main():
         # Clear previous results
         st.session_state.thumbnails = []
         st.session_state.processing_complete = False
+        st.session_state.data_summary = None
         
         # Convert polygon to GEE geometry
         geojson = {"type": "Polygon", "coordinates": [list(selected_polygon.exterior.coords)]}
@@ -601,7 +610,7 @@ def main():
                 start_date_str = start_date.strftime('%Y-%m-%d')
                 end_date_str = end_date.strftime('%Y-%m-%d')
                 
-                final_collection = create_gapfilled_timeseries(
+                final_collection, total_months, months_with_data = create_gapfilled_timeseries(
                     aoi=aoi,
                     start_date=start_date_str,
                     end_date=end_date_str,
@@ -610,10 +619,14 @@ def main():
                     cdi_threshold=cdi_threshold
                 )
                 
+                # Store data summary
+                st.session_state.data_summary = {
+                    'total_months': total_months,
+                    'months_with_data': months_with_data
+                }
+                
                 # Generate and store thumbnails in session state
                 generate_and_store_thumbnails(final_collection, aoi)
-                
-                st.success(f"✅ Successfully created {len(st.session_state.thumbnails)} monthly composites!")
                 
             except Exception as e:
                 st.error(f"❌ Error: {str(e)}")
@@ -625,7 +638,17 @@ def main():
     # ========================================================================
     if st.session_state.processing_complete and st.session_state.thumbnails:
         st.divider()
-        display_thumbnails(st.session_state.thumbnails, num_cols=num_cols)
+        
+        # Display data summary message
+        if st.session_state.data_summary:
+            total = st.session_state.data_summary['total_months']
+            with_data = st.session_state.data_summary['months_with_data']
+            
+            st.success(f"✅ {with_data} months have data from {total} months in the selected period.")
+        
+        # Display thumbnails
+        st.subheader(f"📅 Monthly Composites (RGB)")
+        display_thumbnails(st.session_state.thumbnails)
 
 # ============================================================================
 # Run Application
