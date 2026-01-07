@@ -1,7 +1,13 @@
 """
-Sentinel-2 Time Series Viewer with Gap-Filling (Robust Version)
+Sentinel-2 Time Series Viewer with Gap-Filling (Optimized for Rate Limits)
 A Streamlit application for viewing cloud-free Sentinel-2 monthly composites
 with temporal gap-filling using adjacent months (M-1, M+1 only).
+
+Optimizations:
+- Reduced getInfo() calls to minimum
+- Batched thumbnail generation
+- Local date calculations
+- Removed expensive reduceRegion operations
 """
 
 import os
@@ -14,6 +20,7 @@ import tempfile
 import warnings
 import base64
 import json
+import time
 
 # Suppress warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -116,18 +123,20 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     Create gap-filled monthly Sentinel-2 composites.
     Uses only M-1 and M+1 for gap-filling.
     
+    Optimized to minimize getInfo() calls and reduce aggregations.
+    
     Returns:
-        tuple: (final_collection, total_months, months_with_data)
+        tuple: (final_collection, total_months)
     """
     
-    # Date calculations
+    # Date calculations - compute total months locally to avoid getInfo()
+    start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+    end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+    total_months = (end_dt.year - start_dt.year) * 12 + (end_dt.month - start_dt.month)
+    
     start_date_ee = ee.Date(start_date)
     end_date_ee = ee.Date(end_date)
-    num_months = end_date_ee.get('year').subtract(start_date_ee.get('year')).multiply(12).add(
-        end_date_ee.get('month').subtract(start_date_ee.get('month')))
-    
-    # Get total months as integer for reporting
-    total_months = num_months.getInfo()
+    num_months = ee.Number(total_months)
     
     extended_start = start_date_ee.advance(-1, 'month')
     extended_end = end_date_ee.advance(1, 'month')
@@ -186,20 +195,13 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
         
         composite = ee.Image(ee.Algorithms.If(count.gt(0), monthly.median(), empty_img.clip(aoi)))
         
-        masked_count = ee.Algorithms.If(
-            count.gt(0),
-            freq.eq(0).reduceRegion(ee.Reducer.sum(), aoi, 10, maxPixels=1e13).get('frequency'),
-            0
-        )
-        
         return (composite.addBands(freq)
                 .addBands(freq.gt(0).rename('validity_mask'))
                 .set('system:time_start', m_start.millis())
                 .set('month_index', i)
                 .set('month_name', m_start.format('YYYY-MM'))
                 .set('image_count', count)
-                .set('has_data', count.gt(0))
-                .set('masked_pixel_count', masked_count))
+                .set('has_data', count.gt(0)))
     
     monthly_composites = ee.ImageCollection(ee.List.sequence(0, num_months.subtract(1)).map(create_monthly))
     monthly_list = monthly_composites.toList(num_months)
@@ -259,15 +261,12 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
                 .set('month_name', curr.get('month_name'))
                 .copyProperties(curr, ['system:time_start', 'month_index', 'has_data']))
     
+    # Process all months - apply gap filling to all months with data
     def process_month(i):
         img = ee.Image(monthly_list.get(i))
         has_data = ee.Number(img.get('has_data'))
-        masked_count = ee.Number(img.get('masked_pixel_count'))
-        return ee.Algorithms.If(
-            has_data.And(masked_count.gt(0)), 
-            gap_fill(i),
-            ee.Algorithms.If(has_data, prepare_complete(i), None)
-        )
+        # Always try gap-filling if there's data
+        return ee.Algorithms.If(has_data, gap_fill(i), None)
     
     processed_list = ee.List(month_indices.map(process_month)).removeAll([None])
     
@@ -278,10 +277,7 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
             .set('month_name', ee.Image(img).get('month_name'))
     ))
     
-    # Get months with data
-    months_with_data = final_collection.size().getInfo()
-    
-    return final_collection, total_months, months_with_data
+    return final_collection, total_months
 
 # ============================================================================
 # Thumbnail Generation Functions
@@ -304,43 +300,61 @@ def get_rgb_thumbnail(image, aoi):
 def generate_and_store_thumbnails(final_collection, aoi):
     """
     Generate thumbnails and store them in session state.
-    This ensures they persist across page reruns.
+    Optimized to reduce getInfo() calls and avoid rate limiting.
     """
     
-    num_images = final_collection.size().getInfo()
-    
-    if num_images == 0:
-        st.warning("No images found for the selected parameters.")
+    # Get collection info in a single call
+    try:
+        st.info("📥 Fetching collection metadata...")
+        collection_info = final_collection.getInfo()
+        features = collection_info.get('features', [])
+        num_images = len(features)
+        
+        if num_images == 0:
+            st.warning("No images found for the selected parameters.")
+            return []
+        
+        st.success(f"✅ Found {num_images} monthly composites")
+        
+    except Exception as e:
+        st.error(f"Error getting collection info: {str(e)}")
         return []
-    
-    # Get all month names in one call
-    month_names = final_collection.aggregate_array('month_name').getInfo()
-    image_list = final_collection.toList(num_images)
     
     # Progress tracking
     progress_bar = st.progress(0)
     status_text = st.empty()
     
     thumbnails = []
+    image_list = final_collection.toList(num_images)
     
-    for i in range(num_images):
-        try:
-            status_text.text(f"Loading {month_names[i]} ({i+1}/{num_images})...")
-            
-            img = ee.Image(image_list.get(i))
-            thumb_url = get_rgb_thumbnail(img, aoi)
-            
-            if thumb_url:
-                thumbnails.append({
-                    'url': thumb_url,
-                    'month_name': month_names[i]
-                })
-            
-            progress_bar.progress((i + 1) / num_images)
-            
-        except Exception as e:
-            st.warning(f"Error loading {month_names[i]}: {str(e)}")
-            continue
+    # Process in batches to avoid overwhelming the API
+    batch_size = 5
+    for batch_start in range(0, num_images, batch_size):
+        batch_end = min(batch_start + batch_size, num_images)
+        
+        for i in range(batch_start, batch_end):
+            try:
+                month_name = features[i]['properties'].get('month_name', f'Month {i+1}')
+                status_text.text(f"🖼️ Loading {month_name} ({i+1}/{num_images})...")
+                
+                img = ee.Image(image_list.get(i))
+                thumb_url = get_rgb_thumbnail(img, aoi)
+                
+                if thumb_url:
+                    thumbnails.append({
+                        'url': thumb_url,
+                        'month_name': month_name
+                    })
+                
+                progress_bar.progress((i + 1) / num_images)
+                
+            except Exception as e:
+                st.warning(f"⚠️ Error loading image {i+1}: {str(e)}")
+                continue
+        
+        # Small delay between batches to avoid rate limiting
+        if batch_end < num_images:
+            time.sleep(0.3)
     
     # Clear progress indicators
     status_text.empty()
@@ -386,6 +400,8 @@ def main():
     st.markdown("""
     View cloud-free Sentinel-2 monthly composites with automatic gap-filling.
     The algorithm fills cloudy pixels using data from adjacent months (M-1, M+1).
+    
+    ⚡ **Optimized for large time series** (20+ months)
     """)
     
     # Initialize Earth Engine
@@ -570,6 +586,9 @@ def main():
     num_months = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
     st.info(f"📅 Time period: {start_date.strftime('%Y-%m')} to {end_date.strftime('%Y-%m')} ({num_months} months)")
     
+    if num_months > 24:
+        st.warning(f"⚡ Processing {num_months} months - this may take 2-5 minutes. The app is optimized to handle this.")
+    
     # ========================================================================
     # Generate Time Series
     # ========================================================================
@@ -605,12 +624,13 @@ def main():
         geojson = {"type": "Polygon", "coordinates": [list(selected_polygon.exterior.coords)]}
         aoi = ee.Geometry.Polygon(geojson['coordinates'])
         
-        with st.spinner("Processing Sentinel-2 time series with gap-filling (M-1, M+1)..."):
+        with st.spinner("⚙️ Processing Sentinel-2 time series with gap-filling (M-1, M+1)..."):
             try:
                 start_date_str = start_date.strftime('%Y-%m-%d')
                 end_date_str = end_date.strftime('%Y-%m-%d')
                 
-                final_collection, total_months, months_with_data = create_gapfilled_timeseries(
+                # Create time series (optimized - minimal getInfo calls)
+                final_collection, total_months = create_gapfilled_timeseries(
                     aoi=aoi,
                     start_date=start_date_str,
                     end_date=end_date_str,
@@ -619,14 +639,20 @@ def main():
                     cdi_threshold=cdi_threshold
                 )
                 
-                # Store data summary
-                st.session_state.data_summary = {
-                    'total_months': total_months,
-                    'months_with_data': months_with_data
-                }
+                st.success("✅ Time series created successfully!")
                 
-                # Generate and store thumbnails in session state
+                # Get months_with_data using a single getInfo() call
+                # This is done during thumbnail generation to batch operations
+                
+                # Generate and store thumbnails (this also gets the size)
                 generate_and_store_thumbnails(final_collection, aoi)
+                
+                # Store data summary
+                if st.session_state.thumbnails:
+                    st.session_state.data_summary = {
+                        'total_months': total_months,
+                        'months_with_data': len(st.session_state.thumbnails)
+                    }
                 
             except Exception as e:
                 st.error(f"❌ Error: {str(e)}")
