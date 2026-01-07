@@ -1,7 +1,7 @@
 """
-Sentinel-2 Time Series Viewer with Gap-Filling
+Sentinel-2 Time Series Viewer with Gap-Filling (Optimized)
 A Streamlit application for viewing cloud-free Sentinel-2 monthly composites
-with temporal gap-filling using adjacent months.
+with temporal gap-filling using adjacent months (M-1, M+1 only).
 """
 
 import os
@@ -113,7 +113,7 @@ def get_utm_epsg(longitude, latitude):
         return f"EPSG:327{zone_number:02d}"
 
 # ============================================================================
-# GEE Processing Functions
+# GEE Processing Functions (OPTIMIZED - M-1 and M+1 only)
 # ============================================================================
 def create_gapfilled_timeseries(aoi, start_date, end_date, 
                                  cloudy_pixel_percentage=10,
@@ -121,6 +121,10 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
                                  cdi_threshold=-0.5):
     """
     Create gap-filled monthly Sentinel-2 composites.
+    
+    OPTIMIZED VERSION:
+    - Uses only M-1 and M+1 for gap-filling (removed M-2)
+    - Simplified processing pipeline
     """
     
     # Date calculations
@@ -128,7 +132,9 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     end_date_ee = ee.Date(end_date)
     num_months = end_date_ee.get('year').subtract(start_date_ee.get('year')).multiply(12).add(
         end_date_ee.get('month').subtract(start_date_ee.get('month')))
-    extended_start = start_date_ee.advance(-2, 'month')
+    
+    # Extended range: only 1 month before and after (reduced from 2)
+    extended_start = start_date_ee.advance(-1, 'month')
     extended_end = end_date_ee.advance(1, 'month')
     
     # Load collections
@@ -204,7 +210,7 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     monthly_list = monthly_composites.toList(num_months)
     month_indices = ee.List.sequence(0, num_months.subtract(1))
     
-    # Gap-filling function
+    # Gap-filling function - OPTIMIZED: Only M-1 and M+1 (removed M-2)
     def gap_fill(month_idx):
         month_idx = ee.Number(month_idx)
         curr = ee.Image(monthly_list.get(month_idx))
@@ -215,11 +221,9 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
         m_end = origin.advance(month_idx.add(1), 'month')
         m_mid_millis = m_start.advance(15, 'day').millis()
         
-        # Collect M-1, M+1, M-2
+        # OPTIMIZED: Only collect M-1 and M+1 (removed M-2)
         candidates = (cloud_free.filterDate(origin.advance(month_idx.subtract(1), 'month'), m_start)
-            .merge(cloud_free.filterDate(m_end, origin.advance(month_idx.add(2), 'month')))
-            .merge(cloud_free.filterDate(origin.advance(month_idx.subtract(2), 'month'),
-                                         origin.advance(month_idx.subtract(1), 'month'))))
+            .merge(cloud_free.filterDate(m_end, origin.advance(month_idx.add(2), 'month'))))
         
         sorted_candidates = candidates.map(
             lambda img: img.set('time_dist', ee.Number(img.get('system:time_start')).subtract(m_mid_millis).abs())
@@ -282,9 +286,9 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     return final_collection, processed_list, monthly_composites
 
 # ============================================================================
-# Visualization Functions
+# Visualization Functions (OPTIMIZED - Batch getInfo calls)
 # ============================================================================
-def get_rgb_thumbnail(image, aoi, scale=100):
+def get_rgb_thumbnail(image, aoi):
     """Get RGB thumbnail from Earth Engine image."""
     try:
         # Select RGB bands and apply visualization
@@ -304,11 +308,16 @@ def get_rgb_thumbnail(image, aoi, scale=100):
         return None
 
 def display_composites_from_ee(final_collection, aoi, num_cols=4):
-    """Display RGB previews directly from Earth Engine."""
+    """
+    Display RGB previews directly from Earth Engine.
     
-    # Get the list of images
-    image_list = final_collection.toList(final_collection.size())
-    num_images = image_list.size().getInfo()
+    OPTIMIZED: 
+    - Batch getInfo() call for all month names at once
+    - Reduced server round-trips
+    """
+    
+    # Get collection size first
+    num_images = final_collection.size().getInfo()
     
     if num_images == 0:
         st.warning("No images to display.")
@@ -316,19 +325,27 @@ def display_composites_from_ee(final_collection, aoi, num_cols=4):
     
     st.success(f"✅ Created {num_images} monthly composites")
     
+    # OPTIMIZED: Get all month names in a single getInfo() call
+    status_text = st.empty()
+    status_text.text("Fetching image metadata...")
+    
+    # Get all month names at once (single server call instead of N calls)
+    month_names = final_collection.aggregate_array('month_name').getInfo()
+    
+    # Get the list of images
+    image_list = final_collection.toList(num_images)
+    
     # Create progress bar
     progress_bar = st.progress(0)
-    status_text = st.empty()
     
-    # Collect all thumbnail URLs and month names
+    # Collect all thumbnail URLs
     thumbnails = []
     
     for i in range(num_images):
         try:
-            img = ee.Image(image_list.get(i))
-            month_name = img.get('month_name').getInfo()
+            status_text.text(f"Loading {month_names[i]} ({i+1}/{num_images})...")
             
-            status_text.text(f"Loading {month_name} ({i+1}/{num_images})...")
+            img = ee.Image(image_list.get(i))
             
             # Get thumbnail URL
             thumb_url = get_rgb_thumbnail(img, aoi)
@@ -336,7 +353,7 @@ def display_composites_from_ee(final_collection, aoi, num_cols=4):
             if thumb_url:
                 thumbnails.append({
                     'url': thumb_url,
-                    'month_name': month_name
+                    'month_name': month_names[i]
                 })
             
             progress_bar.progress((i + 1) / num_images)
@@ -373,7 +390,7 @@ def main():
     st.title("🛰️ Sentinel-2 Time Series Viewer")
     st.markdown("""
     View cloud-free Sentinel-2 monthly composites with automatic gap-filling.
-    The algorithm fills cloudy pixels using data from adjacent months (M-1, M+1, M-2).
+    The algorithm fills cloudy pixels using data from adjacent months (M-1, M+1).
     """)
     
     # Initialize Earth Engine
@@ -616,7 +633,7 @@ def main():
         aoi = ee.Geometry.Polygon(geojson['coordinates'])
         
         # Process time series
-        with st.spinner("Processing Sentinel-2 time series with gap-filling..."):
+        with st.spinner("Processing Sentinel-2 time series with gap-filling (M-1, M+1)..."):
             try:
                 start_date_str = start_date.strftime('%Y-%m-%d')
                 end_date_str = end_date.strftime('%Y-%m-%d')
