@@ -1,5 +1,5 @@
 """
-Sentinel-2 Time Series Viewer with Gap-Filling (Optimized)
+Sentinel-2 Time Series Viewer with Gap-Filling (Robust Version)
 A Streamlit application for viewing cloud-free Sentinel-2 monthly composites
 with temporal gap-filling using adjacent months (M-1, M+1 only).
 """
@@ -9,15 +9,11 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 import streamlit as st
 import numpy as np
-import matplotlib.pyplot as plt
 from datetime import datetime, date
-from dateutil.relativedelta import relativedelta
 import tempfile
 import warnings
-import sys
 import base64
 import json
-from pathlib import Path
 
 # Suppress warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -34,9 +30,8 @@ st.set_page_config(
 import folium
 from folium import plugins
 from streamlit_folium import st_folium
-from shapely.geometry import Polygon, mapping
+from shapely.geometry import Polygon
 import ee
-import geemap
 
 # ============================================================================
 # Session State Initialization
@@ -47,8 +42,8 @@ if 'last_drawn_polygon' not in st.session_state:
     st.session_state.last_drawn_polygon = None
 if 'ee_initialized' not in st.session_state:
     st.session_state.ee_initialized = False
-if 'monthly_images' not in st.session_state:
-    st.session_state.monthly_images = []
+if 'thumbnails' not in st.session_state:
+    st.session_state.thumbnails = []
 if 'processing_complete' not in st.session_state:
     st.session_state.processing_complete = False
 
@@ -56,8 +51,6 @@ if 'processing_complete' not in st.session_state:
 # Constants
 # ============================================================================
 SPECTRAL_BANDS = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B12']
-BAND_NAMES = ['Aerosols', 'Blue', 'Green', 'Red', 'Red Edge 1', 'Red Edge 2', 
-              'Red Edge 3', 'NIR', 'Red Edge 4', 'Water Vapor', 'SWIR1', 'SWIR2']
 
 # ============================================================================
 # Earth Engine Authentication
@@ -70,7 +63,6 @@ def initialize_earth_engine():
         return True, "Earth Engine already initialized"
     except Exception:
         try:
-            # Try service account authentication from environment variable
             base64_key = os.environ.get('GOOGLE_EARTH_ENGINE_KEY_BASE64')
             
             if base64_key:
@@ -89,7 +81,6 @@ def initialize_earth_engine():
                 os.unlink(key_file.name)
                 return True, "Successfully authenticated with Earth Engine (Service Account)!"
             else:
-                # Try interactive authentication
                 ee.Authenticate()
                 ee.Initialize()
                 return True, "Successfully authenticated with Earth Engine!"
@@ -113,7 +104,7 @@ def get_utm_epsg(longitude, latitude):
         return f"EPSG:327{zone_number:02d}"
 
 # ============================================================================
-# GEE Processing Functions (OPTIMIZED - M-1 and M+1 only)
+# GEE Processing Functions
 # ============================================================================
 def create_gapfilled_timeseries(aoi, start_date, end_date, 
                                  cloudy_pixel_percentage=10,
@@ -121,10 +112,7 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
                                  cdi_threshold=-0.5):
     """
     Create gap-filled monthly Sentinel-2 composites.
-    
-    OPTIMIZED VERSION:
-    - Uses only M-1 and M+1 for gap-filling (removed M-2)
-    - Simplified processing pipeline
+    Uses only M-1 and M+1 for gap-filling.
     """
     
     # Date calculations
@@ -133,7 +121,6 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     num_months = end_date_ee.get('year').subtract(start_date_ee.get('year')).multiply(12).add(
         end_date_ee.get('month').subtract(start_date_ee.get('month')))
     
-    # Extended range: only 1 month before and after (reduced from 2)
     extended_start = start_date_ee.advance(-1, 'month')
     extended_end = end_date_ee.advance(1, 'month')
     
@@ -155,7 +142,7 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
         condition=ee.Filter.equals(leftField='system:index', rightField='system:index')
     )).map(lambda img: img.addBands(ee.Image(img.get('cloud_prob'))))
     
-    # Cloud masking function with configurable thresholds
+    # Cloud masking function
     def mask_clouds(img):
         is_cloud = img.select('probability').gt(cloud_probability_threshold).And(
             ee.Algorithms.Sentinel2.CDI(img).lt(cdi_threshold)
@@ -210,7 +197,7 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     monthly_list = monthly_composites.toList(num_months)
     month_indices = ee.List.sequence(0, num_months.subtract(1))
     
-    # Gap-filling function - OPTIMIZED: Only M-1 and M+1 (removed M-2)
+    # Gap-filling function (M-1 and M+1 only)
     def gap_fill(month_idx):
         month_idx = ee.Number(month_idx)
         curr = ee.Image(monthly_list.get(month_idx))
@@ -221,7 +208,7 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
         m_end = origin.advance(month_idx.add(1), 'month')
         m_mid_millis = m_start.advance(15, 'day').millis()
         
-        # OPTIMIZED: Only collect M-1 and M+1 (removed M-2)
+        # Only M-1 and M+1
         candidates = (cloud_free.filterDate(origin.advance(month_idx.subtract(1), 'month'), m_start)
             .merge(cloud_free.filterDate(m_end, origin.advance(month_idx.add(2), 'month'))))
         
@@ -283,18 +270,15 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
             .set('month_name', ee.Image(img).get('month_name'))
     ))
     
-    return final_collection, processed_list, monthly_composites
+    return final_collection
 
 # ============================================================================
-# Visualization Functions (OPTIMIZED - Batch getInfo calls)
+# Thumbnail Generation Functions
 # ============================================================================
 def get_rgb_thumbnail(image, aoi):
-    """Get RGB thumbnail from Earth Engine image."""
+    """Get RGB thumbnail URL from Earth Engine image."""
     try:
-        # Select RGB bands and apply visualization
         rgb_image = image.select(['B4', 'B3', 'B2'])
-        
-        # Get thumbnail URL
         thumb_url = rgb_image.getThumbURL({
             'region': aoi,
             'dimensions': 256,
@@ -302,43 +286,30 @@ def get_rgb_thumbnail(image, aoi):
             'max': 0.3,
             'format': 'png'
         })
-        
         return thumb_url
     except Exception as e:
         return None
 
-def display_composites_from_ee(final_collection, aoi, num_cols=4):
+def generate_and_store_thumbnails(final_collection, aoi):
     """
-    Display RGB previews directly from Earth Engine.
-    
-    OPTIMIZED: 
-    - Batch getInfo() call for all month names at once
-    - Reduced server round-trips
+    Generate thumbnails and store them in session state.
+    This ensures they persist across page reruns.
     """
     
-    # Get collection size first
     num_images = final_collection.size().getInfo()
     
     if num_images == 0:
-        st.warning("No images to display.")
-        return
+        st.warning("No images found for the selected parameters.")
+        return []
     
-    st.success(f"✅ Created {num_images} monthly composites")
-    
-    # OPTIMIZED: Get all month names in a single getInfo() call
-    status_text = st.empty()
-    status_text.text("Fetching image metadata...")
-    
-    # Get all month names at once (single server call instead of N calls)
+    # Get all month names in one call
     month_names = final_collection.aggregate_array('month_name').getInfo()
-    
-    # Get the list of images
     image_list = final_collection.toList(num_images)
     
-    # Create progress bar
+    # Progress tracking
     progress_bar = st.progress(0)
+    status_text = st.empty()
     
-    # Collect all thumbnail URLs
     thumbnails = []
     
     for i in range(num_images):
@@ -346,8 +317,6 @@ def display_composites_from_ee(final_collection, aoi, num_cols=4):
             status_text.text(f"Loading {month_names[i]} ({i+1}/{num_images})...")
             
             img = ee.Image(image_list.get(i))
-            
-            # Get thumbnail URL
             thumb_url = get_rgb_thumbnail(img, aoi)
             
             if thumb_url:
@@ -359,28 +328,44 @@ def display_composites_from_ee(final_collection, aoi, num_cols=4):
             progress_bar.progress((i + 1) / num_images)
             
         except Exception as e:
-            st.warning(f"Error loading image {i}: {str(e)}")
+            st.warning(f"Error loading {month_names[i]}: {str(e)}")
             continue
     
+    # Clear progress indicators
     status_text.empty()
     progress_bar.empty()
     
-    # Display thumbnails in a grid
-    if thumbnails:
-        st.subheader("📅 Monthly Composites (RGB)")
-        num_rows = (len(thumbnails) + num_cols - 1) // num_cols
-        
-        for row in range(num_rows):
-            cols = st.columns(num_cols)
-            for col_idx in range(num_cols):
-                img_idx = row * num_cols + col_idx
-                if img_idx < len(thumbnails):
-                    with cols[col_idx]:
-                        st.image(
-                            thumbnails[img_idx]['url'],
-                            caption=thumbnails[img_idx]['month_name'],
-                            use_column_width=True
-                        )
+    # Store in session state for persistence
+    st.session_state.thumbnails = thumbnails
+    st.session_state.processing_complete = True
+    
+    return thumbnails
+
+def display_thumbnails(thumbnails, num_cols=4):
+    """
+    Display thumbnails from session state.
+    This function only displays, doesn't generate.
+    """
+    
+    if not thumbnails:
+        st.info("No images to display. Click 'Generate Time Series' to create composites.")
+        return
+    
+    st.subheader(f"📅 Monthly Composites (RGB) - {len(thumbnails)} images")
+    
+    num_rows = (len(thumbnails) + num_cols - 1) // num_cols
+    
+    for row in range(num_rows):
+        cols = st.columns(num_cols)
+        for col_idx in range(num_cols):
+            img_idx = row * num_cols + col_idx
+            if img_idx < len(thumbnails):
+                with cols[col_idx]:
+                    st.image(
+                        thumbnails[img_idx]['url'],
+                        caption=thumbnails[img_idx]['month_name'],
+                        use_column_width=True
+                    )
 
 # ============================================================================
 # Main Application
@@ -416,7 +401,6 @@ def main():
     # ========================================================================
     st.sidebar.header("⚙️ Parameters")
     
-    # Cloud filtering parameters
     st.sidebar.subheader("Cloud Filtering")
     
     cloudy_pixel_percentage = st.sidebar.slider(
@@ -446,22 +430,18 @@ def main():
         help="Cloud Displacement Index threshold for cloud detection"
     )
     
-    # Display options
     st.sidebar.subheader("Display Options")
     num_cols = st.sidebar.slider("Grid Columns", min_value=2, max_value=6, value=4)
     
     # ========================================================================
-    # Main Content
+    # Main Content - Region Selection
     # ========================================================================
-    
-    # Step 1: Region Selection
     st.header("1️⃣ Select Region of Interest")
     st.info("Draw a rectangle or polygon on the map to define your area of interest.")
     
     # Create folium map
     m = folium.Map(location=[35.6892, 51.3890], zoom_start=8)
     
-    # Add drawing tools
     draw = plugins.Draw(
         export=True,
         position='topleft',
@@ -476,7 +456,6 @@ def main():
     )
     m.add_child(draw)
     
-    # Add satellite basemap
     folium.TileLayer(
         tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
         attr='Google Satellite',
@@ -498,7 +477,6 @@ def main():
                 polygon = Polygon(coords)
                 st.session_state.last_drawn_polygon = polygon
                 
-                # Calculate area and UTM zone
                 centroid = polygon.centroid
                 utm_zone = get_utm_zone(centroid.x)
                 utm_epsg = get_utm_epsg(centroid.x, centroid.y)
@@ -512,7 +490,6 @@ def main():
     # Save region button
     if st.button("💾 Save Selected Region"):
         if st.session_state.last_drawn_polygon is not None:
-            # Check if this polygon is already saved
             if not any(p.equals(st.session_state.last_drawn_polygon) for p in st.session_state.drawn_polygons):
                 st.session_state.drawn_polygons.append(st.session_state.last_drawn_polygon)
                 st.success(f"✅ Region saved! Total regions: {len(st.session_state.drawn_polygons)}")
@@ -521,34 +498,12 @@ def main():
         else:
             st.warning("Please draw a polygon on the map first")
     
-    # Manual coordinate entry
-    with st.expander("📝 Or Enter Coordinates Manually"):
-        col1, col2 = st.columns(2)
-        with col1:
-            min_lon = st.number_input("Min Longitude", value=51.0, format="%.4f")
-            max_lon = st.number_input("Max Longitude", value=51.5, format="%.4f")
-        with col2:
-            min_lat = st.number_input("Min Latitude", value=35.5, format="%.4f")
-            max_lat = st.number_input("Max Latitude", value=36.0, format="%.4f")
-        
-        if st.button("Set Region from Coordinates"):
-            coords = [
-                (min_lon, min_lat),
-                (max_lon, min_lat),
-                (max_lon, max_lat),
-                (min_lon, max_lat),
-                (min_lon, min_lat)
-            ]
-            st.session_state.last_drawn_polygon = Polygon(coords)
-            st.success("✅ Region set from coordinates! Click 'Save Selected Region' to save it.")
-    
     # ========================================================================
     # Saved Regions Section
     # ========================================================================
     if st.session_state.drawn_polygons:
         st.subheader("📍 Saved Regions")
         
-        # Display each region with a delete button
         for i, poly in enumerate(st.session_state.drawn_polygons):
             col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
             
@@ -568,11 +523,16 @@ def main():
             with col4:
                 if st.button("🗑️", key=f"delete_region_{i}", help=f"Delete Region {i+1}"):
                     st.session_state.drawn_polygons.pop(i)
+                    # Clear thumbnails when region is deleted
+                    st.session_state.thumbnails = []
+                    st.session_state.processing_complete = False
                     st.rerun()
         
         st.divider()
     
-    # Step 2: Date Selection
+    # ========================================================================
+    # Date Selection
+    # ========================================================================
     st.header("2️⃣ Select Time Period")
     
     col1, col2 = st.columns(2)
@@ -595,19 +555,19 @@ def main():
             help="Select the end date for the time series"
         )
     
-    # Validate dates
     if start_date >= end_date:
         st.error("❌ End date must be after start date!")
         st.stop()
     
-    # Calculate number of months
     num_months = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
     st.info(f"📅 Time period: {start_date.strftime('%Y-%m')} to {end_date.strftime('%Y-%m')} ({num_months} months)")
     
-    # Step 3: Generate and View Time Series
+    # ========================================================================
+    # Generate Time Series
+    # ========================================================================
     st.header("3️⃣ Generate Time Series")
     
-    # Region selector (if multiple regions saved)
+    # Region selector
     selected_polygon = None
     if len(st.session_state.drawn_polygons) > 0:
         polygon_index = st.selectbox(
@@ -628,17 +588,20 @@ def main():
             st.error("❌ Please select a region of interest first!")
             st.stop()
         
+        # Clear previous results
+        st.session_state.thumbnails = []
+        st.session_state.processing_complete = False
+        
         # Convert polygon to GEE geometry
         geojson = {"type": "Polygon", "coordinates": [list(selected_polygon.exterior.coords)]}
         aoi = ee.Geometry.Polygon(geojson['coordinates'])
         
-        # Process time series
         with st.spinner("Processing Sentinel-2 time series with gap-filling (M-1, M+1)..."):
             try:
                 start_date_str = start_date.strftime('%Y-%m-%d')
                 end_date_str = end_date.strftime('%Y-%m-%d')
                 
-                final_collection, processed_list, monthly_composites = create_gapfilled_timeseries(
+                final_collection = create_gapfilled_timeseries(
                     aoi=aoi,
                     start_date=start_date_str,
                     end_date=end_date_str,
@@ -647,14 +610,22 @@ def main():
                     cdi_threshold=cdi_threshold
                 )
                 
-                # Display composites immediately
-                st.divider()
-                display_composites_from_ee(final_collection, aoi, num_cols=num_cols)
+                # Generate and store thumbnails in session state
+                generate_and_store_thumbnails(final_collection, aoi)
+                
+                st.success(f"✅ Successfully created {len(st.session_state.thumbnails)} monthly composites!")
                 
             except Exception as e:
                 st.error(f"❌ Error: {str(e)}")
                 import traceback
                 st.error(traceback.format_exc())
+    
+    # ========================================================================
+    # Display Results (from session state - persists across reruns)
+    # ========================================================================
+    if st.session_state.processing_complete and st.session_state.thumbnails:
+        st.divider()
+        display_thumbnails(st.session_state.thumbnails, num_cols=num_cols)
 
 # ============================================================================
 # Run Application
