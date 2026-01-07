@@ -207,10 +207,30 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     monthly_list = monthly_composites.toList(num_months)
     month_indices = ee.List.sequence(0, num_months.subtract(1))
     
+    # CRITICAL: Check which months have masked pixels
+    # This identifies months that still need gap-filling
+    # We do this in ONE batched operation using .map() instead of individual getInfo() calls
+    # The server can optimize this better than sequential reduceRegion calls
+    def check_has_gaps(img):
+        freq = img.select('frequency')
+        # Use min() to check if ANY pixel has frequency=0 (masked)
+        min_freq = freq.reduceRegion(
+            reducer=ee.Reducer.min(),
+            geometry=aoi,
+            scale=100,  # Coarser scale for faster checking
+            maxPixels=1e9
+        ).get('frequency')
+        has_gaps = ee.Number(min_freq).eq(0)
+        return img.set('has_masked_pixels', has_gaps)
+    
+    # Apply gap check to all images - GEE will batch these operations server-side
+    monthly_with_gap_info = monthly_composites.map(check_has_gaps)
+    monthly_list_updated = monthly_with_gap_info.toList(num_months)
+    
     # Gap-filling function (M-1 and M+1 only)
     def gap_fill(month_idx):
         month_idx = ee.Number(month_idx)
-        curr = ee.Image(monthly_list.get(month_idx))
+        curr = ee.Image(monthly_list_updated.get(month_idx))
         freq = curr.select('frequency')
         gap_mask = freq.eq(0)
         
@@ -254,19 +274,24 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
                 .copyProperties(curr, ['system:time_start', 'month_index', 'has_data']))
     
     def prepare_complete(month_idx):
-        curr = ee.Image(monthly_list.get(month_idx))
+        curr = ee.Image(monthly_list_updated.get(month_idx))
         return (curr.select(SPECTRAL_BANDS)
                 .addBands(curr.select('frequency'))
                 .addBands(ee.Image.constant(0).clip(aoi).toInt8().rename('fill_source'))
                 .set('month_name', curr.get('month_name'))
                 .copyProperties(curr, ['system:time_start', 'month_index', 'has_data']))
     
-    # Process all months - apply gap filling to all months with data
+    # Process all months - only gap-fill months that need it
     def process_month(i):
-        img = ee.Image(monthly_list.get(i))
+        img = ee.Image(monthly_list_updated.get(i))
         has_data = ee.Number(img.get('has_data'))
-        # Always try gap-filling if there's data
-        return ee.Algorithms.If(has_data, gap_fill(i), None)
+        has_gaps = img.get('has_masked_pixels')
+        
+        return ee.Algorithms.If(
+            has_data.And(has_gaps),  # Only gap-fill if has data AND has masked pixels
+            gap_fill(i),
+            ee.Algorithms.If(has_data, prepare_complete(i), None)  # Use as-is if complete
+        )
     
     processed_list = ee.List(month_indices.map(process_month)).removeAll([None])
     
@@ -275,6 +300,7 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
         lambda img: ee.Image(img).select(SPECTRAL_BANDS).toDouble()
             .set('system:index', ee.Image(img).get('month_name'))
             .set('month_name', ee.Image(img).get('month_name'))
+            .set('was_gapfilled', ee.Image(img).propertyNames().contains('fill_source'))
     ))
     
     return final_collection, total_months
@@ -301,6 +327,7 @@ def generate_and_store_thumbnails(final_collection, aoi):
     """
     Generate thumbnails and store them in session state.
     Optimized to reduce getInfo() calls and avoid rate limiting.
+    Also tracks which months were gap-filled.
     """
     
     # Get collection info in a single call
@@ -314,7 +341,10 @@ def generate_and_store_thumbnails(final_collection, aoi):
             st.warning("No images found for the selected parameters.")
             return []
         
-        st.success(f"✅ Found {num_images} monthly composites")
+        # Count gap-filled months
+        gapfilled_count = sum(1 for f in features if f['properties'].get('was_gapfilled', False))
+        
+        st.success(f"✅ Found {num_images} monthly composites ({gapfilled_count} were gap-filled)")
         
     except Exception as e:
         st.error(f"Error getting collection info: {str(e)}")
@@ -335,6 +365,8 @@ def generate_and_store_thumbnails(final_collection, aoi):
         for i in range(batch_start, batch_end):
             try:
                 month_name = features[i]['properties'].get('month_name', f'Month {i+1}')
+                was_gapfilled = features[i]['properties'].get('was_gapfilled', False)
+                
                 status_text.text(f"🖼️ Loading {month_name} ({i+1}/{num_images})...")
                 
                 img = ee.Image(image_list.get(i))
@@ -343,7 +375,8 @@ def generate_and_store_thumbnails(final_collection, aoi):
                 if thumb_url:
                     thumbnails.append({
                         'url': thumb_url,
-                        'month_name': month_name
+                        'month_name': month_name,
+                        'was_gapfilled': was_gapfilled
                     })
                 
                 progress_bar.progress((i + 1) / num_images)
@@ -369,7 +402,7 @@ def generate_and_store_thumbnails(final_collection, aoi):
 def display_thumbnails(thumbnails):
     """
     Display thumbnails from session state.
-    Fixed 4 columns grid.
+    Fixed 4 columns grid with gap-fill indicators.
     """
     
     if not thumbnails:
@@ -385,9 +418,14 @@ def display_thumbnails(thumbnails):
             img_idx = row * num_cols + col_idx
             if img_idx < len(thumbnails):
                 with cols[col_idx]:
+                    # Add indicator for gap-filled months
+                    caption = thumbnails[img_idx]['month_name']
+                    if thumbnails[img_idx].get('was_gapfilled', False):
+                        caption += " 🔄"  # Indicator for gap-filled
+                    
                     st.image(
                         thumbnails[img_idx]['url'],
-                        caption=thumbnails[img_idx]['month_name'],
+                        caption=caption,
                         use_column_width=True
                     )
 
@@ -674,6 +712,7 @@ def main():
         
         # Display thumbnails
         st.subheader(f"📅 Monthly Composites (RGB)")
+        st.caption("🔄 = Gap-filled using adjacent months")
         display_thumbnails(st.session_state.thumbnails)
 
 # ============================================================================
